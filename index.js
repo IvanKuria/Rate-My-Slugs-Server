@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const Fuse = require('fuse.js');
 const fs = require('fs');
 const path = require('path');
@@ -7,6 +8,15 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  limit: 100, // 100 requests per window per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: 'Too many requests, please try again later.' }
+});
+
+app.use(limiter);
 app.use(cors());
 app.use(express.json());
 
