@@ -1,0 +1,38 @@
+name: Keep warm
+
+# Pings the deployed /health endpoint on a schedule so the Render free-tier
+# instance does not spin down (it sleeps after ~15 minutes of inactivity, and
+# a cold start adds ~30-50s of latency to the first grade request). A 10-minute
+# cadence stays comfortably under that idle window. Combined with the client
+# side grade cache in the extension, this largely neutralizes cold starts.
+#
+# Note: GitHub disables scheduled workflows after 60 days with no repo activity,
+# and the schedule can be delayed under load, so this is best-effort. For a
+# hard guarantee, also point an external uptime service (UptimeRobot,
+# cron-job.org) at the same URL.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keep-warm
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /health
+        run: |
+          URL="https://rate-my-slugs-server.onrender.com/health"
+          echo "Pinging $URL"
+          code=$(curl -fsS -L --connect-timeout 20 --max-time 90 \
+            --retry 4 --retry-delay 15 --retry-all-errors \
+            -o /dev/null -w "%{http_code}" "$URL")
+          echo "HTTP $code"
+          test "$code" = "200"
