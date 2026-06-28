@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const Fuse = require('fuse.js');
 const fs = require('fs');
@@ -7,6 +8,16 @@ const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Cache-Control values. Grade data is static / slow-changing, so allow clients
+// and any CDN/proxy to cache it aggressively. A weak ETag is added automatically
+// by Express on res.json(), so conditional GETs (If-None-Match) return 304.
+const CACHE_HIT = 'public, max-age=86400, stale-while-revalidate=604800'; // 1 day, serve-stale 7 days
+const CACHE_MISS = 'public, max-age=3600'; // 1 hour for "not found" so the client recovers after data updates
+
+// Render's free tier sits behind a reverse proxy, so trust the first proxy hop.
+// This lets express-rate-limit read the real client IP from X-Forwarded-For.
+app.set('trust proxy', 1);
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
@@ -16,32 +27,64 @@ const limiter = rateLimit({
   message: { success: false, error: 'Too many requests, please try again later.' }
 });
 
+app.use(compression()); // gzip responses (grade JSON is large and very compressible)
 app.use(limiter);
 app.use(cors());
 app.use(express.json());
 
-// Load grades data
+// ---------------------------------------------------------------------------
+// Data + precomputed lookup structures (built once at boot, not per request)
+// ---------------------------------------------------------------------------
 let gradesData = {};
 let fuseIndex = null;
+// Lowercased surname -> [full instructor names] for O(1) exact-surname lookups.
+let instructorsBySurname = new Map();
+// Full instructor name -> [course codes] (insertion order) so the "any course
+// for this instructor" fallback is O(1) instead of scanning every course.
+let coursesByInstructor = new Map();
+let isReady = false;
 
 function loadGradesData() {
   const filePath = path.join(__dirname, 'grades.json');
   const raw = fs.readFileSync(filePath, 'utf-8');
   gradesData = JSON.parse(raw);
 
-  // Build fuse index from all instructor names
   const instructors = new Set();
-  for (const course of Object.values(gradesData)) {
-    for (const instructor of Object.keys(course)) {
+  instructorsBySurname = new Map();
+  coursesByInstructor = new Map();
+
+  // Single pass over the dataset builds every index we need.
+  for (const [courseName, courseInstructors] of Object.entries(gradesData)) {
+    for (const instructor of Object.keys(courseInstructors)) {
       instructors.add(instructor);
+
+      // Map by surname (last token of the full name) for the fast path.
+      const surname = instructor.split(' ').pop().toLowerCase();
+      let bySurname = instructorsBySurname.get(surname);
+      if (!bySurname) {
+        bySurname = [];
+        instructorsBySurname.set(surname, bySurname);
+      }
+      if (!bySurname.includes(instructor)) bySurname.push(instructor);
+
+      // Map instructor -> courses, preserving course insertion order so the
+      // "first course found" fallback matches the previous scan behavior.
+      let courses = coursesByInstructor.get(instructor);
+      if (!courses) {
+        courses = [];
+        coursesByInstructor.set(instructor, courses);
+      }
+      courses.push(courseName);
     }
   }
 
+  // Fuse is kept only as a fuzzy fallback (typos / non-exact surnames).
   fuseIndex = new Fuse([...instructors], {
     threshold: 0.4,
     includeScore: true
   });
 
+  isReady = true;
   console.log(`Loaded ${Object.keys(gradesData).length} courses`);
   console.log(`Indexed ${instructors.size} instructors`);
 }
@@ -76,13 +119,27 @@ function parseAbbreviatedName(abbrev) {
   };
 }
 
-// Find instructor using fuzzy search
+// Find instructor from an abbreviated "Lastname,F." name.
+// Fast path: exact surname lookup in a precomputed Map (O(1), no Fuse scan).
+// Fallback: Fuse fuzzy search for typos / surnames that aren't the last token.
 function findInstructor(abbreviatedName) {
   if (!fuseIndex) return null;
 
   const parsed = parseAbbreviatedName(abbreviatedName);
   if (!parsed) return null;
 
+  // Fast path: exact surname match, then confirm the first-name initial.
+  const candidates = instructorsBySurname.get(parsed.lastName.toLowerCase());
+  if (candidates) {
+    for (const fullName of candidates) {
+      const firstName = fullName.split(' ')[0];
+      if (firstName.toUpperCase().startsWith(parsed.firstInitial)) {
+        return fullName;
+      }
+    }
+  }
+
+  // Fallback: fuzzy search over all instructor names.
   const results = fuseIndex.search(parsed.lastName);
 
   // Find match where first name starts with the initial
@@ -186,13 +243,15 @@ function aggregateGrades(entries) {
 app.get('/api/grades', (req, res) => {
   const { instructor, course } = req.query;
 
-  if (!instructor) {
+  if (!instructor || typeof instructor !== 'string') {
+    res.set('Cache-Control', 'no-store');
     return res.status(400).json({ success: false, error: 'instructor parameter required' });
   }
 
   // Find instructor
   const matchedInstructor = findInstructor(instructor);
   if (!matchedInstructor) {
+    res.set('Cache-Control', CACHE_MISS);
     return res.json({ success: false, error: 'instructor_not_found' });
   }
 
@@ -207,22 +266,19 @@ app.get('/api/grades', (req, res) => {
     matchedCourse = normalizedCourse;
   }
 
-  // If no specific course or not found, try to find any course with this instructor
-  if (!courseData) {
-    for (const [courseName, instructors] of Object.entries(gradesData)) {
-      if (instructors[matchedInstructor]) {
-        // If no course specified, use first match
-        // If course specified but not exact match, keep looking
-        if (!normalizedCourse) {
-          courseData = instructors[matchedInstructor];
-          matchedCourse = courseName;
-          break;
-        }
-      }
+  // If no specific course was requested, fall back to any course taught by this
+  // instructor. Uses the precomputed map (O(1)) and keeps the previous "first
+  // course found" semantics by relying on insertion-ordered course lists.
+  if (!courseData && !normalizedCourse) {
+    const courses = coursesByInstructor.get(matchedInstructor);
+    if (courses && courses.length > 0) {
+      matchedCourse = courses[0];
+      courseData = gradesData[matchedCourse][matchedInstructor];
     }
   }
 
   if (!courseData || courseData.length === 0) {
+    res.set('Cache-Control', CACHE_MISS);
     return res.json({
       success: false,
       error: 'no_grade_data',
@@ -265,6 +321,7 @@ app.get('/api/grades', (req, res) => {
   const allEntries = courseData;
   const overallAggregated = aggregateGrades(allEntries);
 
+  res.set('Cache-Control', CACHE_HIT);
   res.json({
     success: true,
     matchedInstructor,
@@ -279,9 +336,29 @@ app.get('/api/grades', (req, res) => {
   });
 });
 
-// Health check
+// Lightweight health/readiness check. Returns 200 quickly (no data work), so an
+// external uptime pinger can hit it to keep the Render free-tier dyno warm and
+// mitigate cold-start spin-down. Existing /api/health is preserved below.
+app.get('/health', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.status(isReady ? 200 : 503).json({ status: isReady ? 'ok' : 'starting' });
+});
+
+// Health check (existing endpoint, preserved for backward compatibility)
 app.get('/api/health', (req, res) => {
+  res.set('Cache-Control', 'no-store');
   res.json({ status: 'ok', courses: Object.keys(gradesData).length });
+});
+
+// JSON 404 for unknown routes (so clients never receive an HTML error page).
+app.use((req, res) => {
+  res.status(404).json({ success: false, error: 'not_found' });
+});
+
+// Centralized error handler: always respond with JSON, never an HTML stack trace.
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ success: false, error: 'internal_error' });
 });
 
 // Start server
